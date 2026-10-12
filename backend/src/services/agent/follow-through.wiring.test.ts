@@ -1,4 +1,6 @@
-import { handedOffSince, owedWorkReminder } from './follow-through.wiring.js';
+import { handedOffSince, owedWorkReminder, releaseWorkDeps } from './follow-through.wiring.js';
+import { TaskPoolService } from '../task-pool/task-pool.service.js';
+import { OwnerThreadSentinelService, setOwnerThreadSentinel } from '../messaging/owner-thread-sentinel.service.js';
 import type { WorkItem } from '../../types/v2/work-item.types.js';
 
 jest.mock('../core/logger.service.js', () => ({
@@ -36,5 +38,68 @@ describe('owedWorkReminder', () => {
 		expect(text).not.toContain('other');
 		expect(text).not.toContain('old');
 		expect(owedWorkReminder(items, 'nobody')).toBeNull();
+	});
+});
+
+describe('releaseWorkDeps().parkPromise: one WorkItem per thread + promise', () => {
+	const NOW = Date.parse('2026-10-12T10:00:00Z');
+	let items: WorkItem[];
+	let added: WorkItem[];
+	let sentinel: OwnerThreadSentinelService;
+
+	beforeEach(() => {
+		items = [];
+		added = [];
+		const pool = {
+			getAllItems: async () => items,
+			addToPool: async (item: WorkItem) => {
+				added.push(item);
+				items.push(item);
+				return item;
+			},
+		};
+		jest.spyOn(TaskPoolService, 'getInstance').mockReturnValue(pool as unknown as TaskPoolService);
+		sentinel = new OwnerThreadSentinelService({
+			postStatus: async () => true,
+			nudgeAgent: async () => true,
+			now: () => NOW,
+		});
+		setOwnerThreadSentinel(sentinel);
+	});
+
+	afterEach(() => {
+		setOwnerThreadSentinel(null);
+		jest.restoreAllMocks();
+	});
+
+	function promise(text: string, at = NOW - 60_000): void {
+		const ref = { slackChannelId: 'C1', threadTs: '1.1' };
+		sentinel.noteOwnerMessage({ ...ref, agent: 'atlas', at: at - 1000 });
+		sentinel.noteAgentPost({ ...ref, agent: 'atlas', text, at });
+	}
+
+	it('an unkept promise makes exactly one item, however often the agent is stopped', async () => {
+		promise("I'll redo the cover now, ~10 min");
+		const first = await releaseWorkDeps().parkPromise!('atlas');
+		const second = await releaseWorkDeps().parkPromise!('atlas');
+		expect(first).toBe(added[0].id);
+		expect(second).toBeNull();
+		expect(added).toHaveLength(1);
+		expect((added[0].metadata as Record<string, unknown>)['promiseKey']).toMatch(/^C1:1\.1@\d+$/);
+	});
+
+	it('an item for the same thread + promise that already exists (even done) is not made again', async () => {
+		promise("I'll redo the cover now, ~10 min");
+		const key = sentinel.parkablePromise('atlas')!.key;
+		items.push(wi({ id: 'old', target: 'atlas', status: 'done', metadata: { promiseKey: key } }));
+		expect(await releaseWorkDeps().parkPromise!('atlas')).toBeNull();
+		expect(added).toHaveLength(0);
+	});
+
+	it('a promise the agent followed up on makes no item', async () => {
+		promise("I'll redo the cover now, ~10 min");
+		sentinel.noteAgentPost({ slackChannelId: 'C1', threadTs: '1.1', agent: 'atlas', text: 'Done: it is in the thread.', at: NOW - 1000 });
+		expect(await releaseWorkDeps().parkPromise!('atlas')).toBeNull();
+		expect(added).toHaveLength(0);
 	});
 });
